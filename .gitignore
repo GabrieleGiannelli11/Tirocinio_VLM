@@ -1,0 +1,26 @@
+# ==========================
+# Python
+# ==========================
+
+__pycache__/
+*.py[cod]
+
+# ==========================
+# Visual Studio Code
+# ==========================
+
+.vscode/
+
+# ==========================
+# File di sistema Windows
+# ==========================
+
+Thumbs.db
+Desktop.ini
+
+# ==========================
+# Output generati dal programma
+# ==========================
+
+output/*
+!output/.gitkeep

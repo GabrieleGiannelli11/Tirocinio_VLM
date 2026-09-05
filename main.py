@@ -16,18 +16,18 @@ import config                # Importa le configurazioni definite in config.py
 # Funzione per codificare un'immagine in Base64
 # ============================
 
-def encode_image(path):
+def encode_image(image_path):
     """
     Converte un'immagine in una stringa Base64.
 
     Args:
-        path: percorso del file immagine.
+        image_path: percorso del file immagine.
 
     Returns:
         La stringa Base64 dell'immagine.
     """
     
-    with open(path, "rb") as f:
+    with open(image_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
     
 # ============================
@@ -125,15 +125,46 @@ def generate_description(
     return response
 
 # ============================
+# Funzione per estrarre le metriche del backend
+# ============================
+
+def extract_backend_metrics(response):
+    """
+    Estrae le metriche di esecuzione indipendentemente
+    dal backend utilizzato.
+
+    Args:
+        response: risposta restituita dal server OpenAI compatibile.
+
+    Returns:
+        Un dizionario contenente:
+        - prompt_ms
+        - predicted_ms
+        - predicted_per_second
+    """
+
+    # Caso llama.cpp
+    if hasattr(response, "timings"):
+        return response.timings
+
+    # Caso vLLM
+    if hasattr(response, "metrics") and response.metrics is not None:
+        return {
+            "prompt_ms": response.metrics["time_to_first_token_ms"],
+            "predicted_ms": response.metrics["generation_time_ms"],
+            "predicted_per_second": response.metrics["tokens_per_second"]
+        }
+
+    raise RuntimeError("Il backend non restituisce metriche.")
+
+# ============================
 # Funzione per salvare la configurazione dell'esperimento
 # ============================
 
 def save_experiment_config(
-    model_name,
-    temperature,
+    models,
     max_tokens,
-    top_p,
-    seed,
+    decoding_configs,
     input_csv,
     output_csv
 ):
@@ -141,20 +172,17 @@ def save_experiment_config(
     Salva i parametri utilizzati durante l'esperimento in un file JSON.
 
     Args:
-        model_name: nome del modello utilizzato.
-        temperature: temperatura della generazione.
+        models: lista dei nomi dei modelli utilizzati.
         max_tokens: numero massimo di token.
-        top_p: parametro top-p.
-        seed: seed del generatore casuale per rendere l'esperimento riproducibile.
+        decoding_configs: configurazioni di decoding utilizzate.
         input_csv: percorso del file CSV di input.
         output_csv: percorso del file CSV di output.
     """
+
     experiment_config = {
-        "model": model_name,
-        "temperature": temperature,
+        "models": models,
         "max_tokens": max_tokens,
-        "top_p": top_p,
-        "seed": seed,
+        "decoding_configs": decoding_configs,
         "input_csv": input_csv
     }
 
@@ -211,11 +239,9 @@ client = OpenAI(
 )
 
 save_experiment_config(
-    config.MODEL_NAME,
-    config.TEMPERATURE,
+    config.MODELS,
     config.MAX_TOKENS,
-    config.TOP_P,
-    config.SEED,
+    config.DECODING_CONFIGS,
     config.INPUT_CSV,
     config.OUTPUT_CSV
 )
@@ -232,7 +258,7 @@ df = pd.read_csv(config.INPUT_CSV, sep=";")
 
 total_input_images = len(df) # Numero totale di immagini nel CSV
 
-df["response"] = "" # Nuova colonna che conterrà la risposta del modello
+results = [] # Lista che conterrà i risultati di tutte le inferenze
 
 metrics = [] # Lista che conterrà le metriche di tutte le inferenze
 
@@ -246,8 +272,25 @@ for index, row in df.iterrows():
 
     # Controlla che il file immagine esista
     if not os.path.exists(row["image_path"]):
-        df.loc[index, "response"] = "ERRORE: Immagine non trovata"
-        continue
+
+        # Crea un risultato di errore per ogni modello e configurazione di decoding
+        for model_name in config.MODELS:
+
+            # Crea un risultato di errore per ogni configurazione di decoding
+            for decoding_name, decoding_config in config.DECODING_CONFIGS.items():
+
+                results.append({
+                    "image": row["image_path"],
+                    "prompt": row["prompt"],
+                    "model": model_name,
+                    "decoding": decoding_name,
+                    "temperature": decoding_config["temperature"],
+                    "top_p": decoding_config["top_p"],
+                    "seed": decoding_config["seed"],
+                    "response": "ERRORE: Immagine non trovata"
+                })
+
+            continue
 
     image_b64 = encode_image(row["image_path"])
 
@@ -255,50 +298,106 @@ for index, row in df.iterrows():
 
     # Controlla che il formato sia supportato
     if mime_type is None:
-        df.loc[index, "response"] = "ERRORE: Formato immagine non supportato"
+
+        # Esegue l'inferenza con ogni modello
+        for model_name in config.MODELS:
+
+            # Crea un risultato di errore per ogni configurazione di decoding
+            for decoding_name, decoding_config in config.DECODING_CONFIGS.items():
+
+                results.append({
+                    "image": row["image_path"],
+                    "prompt": row["prompt"],
+                    "model": model_name,
+                    "decoding": decoding_name,
+                    "temperature": decoding_config["temperature"],
+                    "top_p": decoding_config["top_p"],
+                    "seed": decoding_config["seed"],
+                    "response": "ERRORE: Formato immagine non supportato"
+                })
+
         continue
 
-    try:
+    # Esegue l'inferenza con ogni modello
+    for model_name in config.MODELS:
 
-        response = generate_description(
-            client,
-            config.MODEL_NAME,
-            image_b64,
-            mime_type,
-            row["prompt"],
-            config.TEMPERATURE,
-            config.MAX_TOKENS,
-            config.TOP_P,
-            config.SEED
-        )
+        # Esegue l'inferenza con ogni configurazione di decoding
+        for decoding_name, decoding_config in config.DECODING_CONFIGS.items():
 
-        # Salva le metriche dell'inferenza corrente
-        metric = {
-            "image": row["image_path"],
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens,
-            "prompt_ms": response.timings["prompt_ms"],
-            "predicted_ms": response.timings["predicted_ms"],
-            "predicted_per_second": response.timings["predicted_per_second"]
-        }
+            try:
 
-        # Estrae il testo della risposta generata dal modello
-        description = response.choices[0].message.content
+                response = generate_description(
+                    client,
+                    model_name,
+                    image_b64,
+                    mime_type,
+                    row["prompt"],
+                    decoding_config["temperature"],
+                    config.MAX_TOKENS,
+                    decoding_config["top_p"],
+                    decoding_config["seed"]
+                )
 
-        df.loc[index, "response"] = description
+                backend_metrics = extract_backend_metrics(response)
 
-        metrics.append(metric)
+                # Estrae il testo della risposta generata dal modello
+                description = response.choices[0].message.content
 
-    except Exception as e:
+                # Salva il risultato dell'inferenza
+                result = {
+                    "image": row["image_path"],
+                    "prompt": row["prompt"],
+                    "model": model_name,
+                    "decoding": decoding_name,
+                    "temperature": decoding_config["temperature"],
+                    "top_p": decoding_config["top_p"],
+                    "seed": decoding_config["seed"],
+                    "response": description
+                }
 
-        df.loc[index, "response"] = f"ERRORE: {e}" # Salva l'errore nel DataFrame
+                results.append(result)
+
+                # Salva le metriche dell'inferenza corrente
+                metric = {
+                    "image": row["image_path"],
+                    "model": model_name,
+                    "decoding": decoding_name,
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens,
+                    "prompt_ms": backend_metrics["prompt_ms"],
+                    "predicted_ms": backend_metrics["predicted_ms"],
+                    "predicted_per_second": backend_metrics["predicted_per_second"]
+                }
+
+                metrics.append(metric)
+
+            except Exception as e:
+
+                # Salva l'errore relativo a questa configurazione
+                results.append({
+                    "image": row["image_path"],
+                    "prompt": row["prompt"],
+                    "model": model_name,
+                    "decoding": decoding_name,
+                    "temperature": decoding_config["temperature"],
+                    "top_p": decoding_config["top_p"],
+                    "seed": decoding_config["seed"],
+                    "response": f"ERRORE: {e}"
+                })
 
 # ============================
 # Salvataggio dei risultati
 # ============================
 
-df.to_csv(config.OUTPUT_CSV, index=False)
+results_df = pd.DataFrame(results)
+
+results_df.to_csv(
+    config.OUTPUT_CSV,
+    sep=";",
+    index=False,
+    encoding="utf-8-sig"
+)
 
 experiment_end = time.time()
 
@@ -307,12 +406,15 @@ experiment_time = round(
     2
 )
 
-# Crea il riepilogo delle metriche dell'esperimento
+# ============================
+# Creazione del riepilogo delle metriche
+# ============================
+
 if metrics:
 
     summary = {
         "total_input_images": total_input_images,
-        "successful_images": len(metrics),
+        "successful_inferences": len(metrics), 
         "total_experiment_time_seconds": experiment_time,
 
         "average_prompt_tokens": round(
@@ -368,7 +470,7 @@ else:
 
     summary = {
         "total_input_images": total_input_images,
-        "successful_images": 0,
+        "successful_inferences": 0,
         "total_experiment_time_seconds": experiment_time
     }
 

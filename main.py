@@ -6,6 +6,7 @@ import base64                # Per convertire le immagini in Base64
 import json                  # Per lavorare con dati JSON
 import os                    # Per lavorare con file e percorsi
 import time                  # Per misurare il tempo di esecuzione dell'esperimento
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd          # Per leggere e scrivere file CSV
 from openai import OpenAI    # Client per comunicare con il server del modello AI
@@ -123,6 +124,81 @@ def generate_description(
     )
 
     return response
+
+# ============================
+# Funzione per elaborare un batch di richieste
+# ============================
+
+def generate_batch(
+    client,
+    batch,
+    model_name,
+    temperature,
+    max_tokens,
+    top_p,
+    seed
+):
+    """
+    Invia contemporaneamente le richieste contenute nel batch.
+
+    Args:
+        client: client OpenAI compatibile.
+        batch: lista di coppie immagine-prompt già preparate.
+        model_name: nome del modello da utilizzare.
+        temperature: temperatura di generazione.
+        max_tokens: numero massimo di token della risposta.
+        top_p: parametro di campionamento.
+        seed: seed per la riproducibilità.
+
+    Returns:
+        Lista dei risultati, nello stesso ordine degli elementi
+        presenti nel batch.
+    """
+
+    batch_responses = [None] * len(batch)
+
+    with ThreadPoolExecutor(
+        max_workers=config.BATCH_SIZE
+    ) as executor:
+
+        futures = {}
+
+        for index, item in enumerate(batch):
+
+            future = executor.submit(
+                generate_description,
+                client,
+                model_name,
+                item["image_b64"],
+                item["mime_type"],
+                item["prompt"],
+                temperature,
+                max_tokens,
+                top_p,
+                seed
+            )
+
+            futures[future] = index
+
+        for future in as_completed(futures):
+                
+            index = futures[future]
+
+            try:
+
+                batch_responses[index] = {
+                    "success": True,
+                    "response": future.result()
+                }
+
+            except Exception as e:
+
+                batch_responses[index] = {
+                    "success": False,
+                    "error": str(e)
+                }
+
+    return batch_responses
 
 # ============================
 # Funzione per estrarre le metriche del backend
@@ -256,7 +332,7 @@ save_experiment_config(
 
 df = pd.read_csv(config.INPUT_CSV, sep=";")
 
-total_input_images = len(df) # Numero totale di immagini nel CSV
+total_input_pairs = len(df) # Numero totale di coppie immagine-prompt nel CSV
 
 results = [] # Lista che conterrà i risultati di tutte le inferenze
 
@@ -265,60 +341,82 @@ metrics = [] # Lista che conterrà le metriche di tutte le inferenze
 experiment_start = time.time()
 
 # ============================
-# Elaborazione di ogni riga del CSV
+# Elaborazione dei batch
 # ============================
 
-for index, row in df.iterrows():
+for batch_start in range(0, len(df), config.BATCH_SIZE):
 
-    # Controlla che il file immagine esista
-    if not os.path.exists(row["image_path"]):
+    batch_df = df.iloc[
+        batch_start:batch_start + config.BATCH_SIZE
+    ]
 
-        # Crea un risultato di errore per ogni modello e configurazione di decoding
-        for model_name in config.MODELS:
+    batch = []
 
-            # Crea un risultato di errore per ogni configurazione di decoding
-            for decoding_name, decoding_config in config.DECODING_CONFIGS.items():
+    for index, row in batch_df.iterrows():
 
-                results.append({
-                    "image": row["image_path"],
-                    "prompt": row["prompt"],
-                    "model": model_name,
-                    "decoding": decoding_name,
-                    "temperature": decoding_config["temperature"],
-                    "top_p": decoding_config["top_p"],
-                    "seed": decoding_config["seed"],
-                    "response": "ERRORE: Immagine non trovata"
-                })
+        # Controlla che il file immagine esista
+        if not os.path.exists(row["image_path"]):
+
+            # Crea un risultato di errore per ogni modello e configurazione di decoding
+            for model_name in config.MODELS:
+
+                # Crea un risultato di errore per ogni configurazione di decoding
+                for decoding_name, decoding_config in config.DECODING_CONFIGS.items():
+
+                    results.append({
+                        "image": row["image_path"],
+                        "prompt": row["prompt"],
+                        "model": model_name,
+                        "decoding": decoding_name,
+                        "temperature": decoding_config["temperature"],
+                        "top_p": decoding_config["top_p"],
+                        "seed": decoding_config["seed"],
+                        "response": "ERRORE: Immagine non trovata"
+                    })
 
             continue
 
-    image_b64 = encode_image(row["image_path"])
+        # Codifica l'immagine in Base64
+        image_b64 = encode_image(row["image_path"])
 
-    mime_type = get_mime_type(row["image_path"])
+        # Ottiene il MIME type dell'immagine
+        mime_type = get_mime_type(row["image_path"])
 
-    # Controlla che il formato sia supportato
-    if mime_type is None:
+        # Controlla che il formato sia supportato
+        if mime_type is None:
 
-        # Esegue l'inferenza con ogni modello
-        for model_name in config.MODELS:
+            # Esegue l'inferenza con ogni modello
+            for model_name in config.MODELS:
 
-            # Crea un risultato di errore per ogni configurazione di decoding
-            for decoding_name, decoding_config in config.DECODING_CONFIGS.items():
+                # Crea un risultato di errore per ogni configurazione di decoding
+                for decoding_name, decoding_config in config.DECODING_CONFIGS.items():
 
-                results.append({
-                    "image": row["image_path"],
-                    "prompt": row["prompt"],
-                    "model": model_name,
-                    "decoding": decoding_name,
-                    "temperature": decoding_config["temperature"],
-                    "top_p": decoding_config["top_p"],
-                    "seed": decoding_config["seed"],
-                    "response": "ERRORE: Formato immagine non supportato"
-                })
+                    results.append({
+                        "image": row["image_path"],
+                        "prompt": row["prompt"],
+                        "model": model_name,
+                        "decoding": decoding_name,
+                        "temperature": decoding_config["temperature"],
+                        "top_p": decoding_config["top_p"],
+                        "seed": decoding_config["seed"],
+                        "response": "ERRORE: Formato immagine non supportato"
+                    })
 
+            continue
+
+        # Aggiunge la coppia valida alla batch
+        batch.append({
+            "index": index,
+            "image_path": row["image_path"],
+            "prompt": row["prompt"],
+            "image_b64": image_b64,
+            "mime_type": mime_type
+        })
+
+    if not batch:
         continue
 
-    # Esegue l'inferenza con ogni modello
+# Esegue l'inferenza con ogni modello
     for model_name in config.MODELS:
 
         # Esegue l'inferenza con ogni configurazione di decoding
@@ -326,65 +424,106 @@ for index, row in df.iterrows():
 
             try:
 
-                response = generate_description(
+                batch_results = generate_batch(
                     client,
+                    batch,
                     model_name,
-                    image_b64,
-                    mime_type,
-                    row["prompt"],
                     decoding_config["temperature"],
                     config.MAX_TOKENS,
                     decoding_config["top_p"],
                     decoding_config["seed"]
                 )
 
-                backend_metrics = extract_backend_metrics(response)
-
-                # Estrae il testo della risposta generata dal modello
-                description = response.choices[0].message.content
-
-                # Salva il risultato dell'inferenza
-                result = {
-                    "image": row["image_path"],
-                    "prompt": row["prompt"],
-                    "model": model_name,
-                    "decoding": decoding_name,
-                    "temperature": decoding_config["temperature"],
-                    "top_p": decoding_config["top_p"],
-                    "seed": decoding_config["seed"],
-                    "response": description
-                }
-
-                results.append(result)
-
-                # Salva le metriche dell'inferenza corrente
-                metric = {
-                    "image": row["image_path"],
-                    "model": model_name,
-                    "decoding": decoding_name,
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                    "prompt_ms": backend_metrics["prompt_ms"],
-                    "predicted_ms": backend_metrics["predicted_ms"],
-                    "predicted_per_second": backend_metrics["predicted_per_second"]
-                }
-
-                metrics.append(metric)
-
             except Exception as e:
 
-                # Salva l'errore relativo a questa configurazione
-                results.append({
-                    "image": row["image_path"],
-                    "prompt": row["prompt"],
-                    "model": model_name,
-                    "decoding": decoding_name,
-                    "temperature": decoding_config["temperature"],
-                    "top_p": decoding_config["top_p"],
-                    "seed": decoding_config["seed"],
-                    "response": f"ERRORE: {e}"
-                })
+                # Salva l'errore relativo alla batch corrente
+                for item in batch:
+
+                    results.append({
+                        "image": item["image_path"],
+                        "prompt": item["prompt"],
+                        "model": model_name,
+                        "decoding": decoding_name,
+                        "temperature": decoding_config["temperature"],
+                        "top_p": decoding_config["top_p"],
+                        "seed": decoding_config["seed"],
+                        "response": f"ERRORE: {e}"
+                    })
+
+                continue
+
+            # Associa ogni risposta alla rispettiva coppia
+            for item, batch_result in zip(batch, batch_results):
+
+                # Controlla se la richiesta è andata a buon fine
+                if not batch_result["success"]:
+
+                    results.append({
+                        "image": item["image_path"],
+                        "prompt": item["prompt"],
+                        "model": model_name,
+                        "decoding": decoding_name,
+                        "temperature": decoding_config["temperature"],
+                        "top_p": decoding_config["top_p"],
+                        "seed": decoding_config["seed"],
+                        "response": f"ERRORE: {batch_result['error']}"
+                    })
+
+                    continue
+
+                try:
+
+                    # Recupera la vera risposta del server
+                    response = batch_result["response"]
+
+                    # Estrae le metriche del backend
+                    backend_metrics = extract_backend_metrics(response)
+
+                    # Estrae il testo della risposta generata dal modello
+                    description = response.choices[0].message.content
+
+                    # Salva il risultato dell'inferenza
+                    result = {
+                        "image": item["image_path"],
+                        "prompt": item["prompt"],
+                        "model": model_name,
+                        "decoding": decoding_name,
+                        "temperature": decoding_config["temperature"],
+                        "top_p": decoding_config["top_p"],
+                        "seed": decoding_config["seed"],
+                        "response": description
+                    }
+
+                    results.append(result)
+
+                    # Salva le metriche dell'inferenza corrente
+                    metric = {
+                        "image": item["image_path"],
+                        "model": model_name,
+                        "decoding": decoding_name,
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens,
+                        "prompt_ms": backend_metrics["prompt_ms"],
+                        "predicted_ms": backend_metrics["predicted_ms"],
+                        "predicted_per_second": backend_metrics["predicted_per_second"]
+                    }
+
+                    metrics.append(metric)
+
+                except Exception as e:
+
+                    # Salva l'errore relativo alla singola coppia
+                    results.append({
+                        "image": item["image_path"],
+                        "prompt": item["prompt"],
+                        "model": model_name,
+                        "decoding": decoding_name,
+                        "temperature": decoding_config["temperature"],
+                        "top_p": decoding_config["top_p"],
+                        "seed": decoding_config["seed"],
+                        "response": f"ERRORE: {e}"
+                    })
 
 # ============================
 # Salvataggio dei risultati
@@ -413,7 +552,7 @@ experiment_time = round(
 if metrics:
 
     summary = {
-        "total_input_images": total_input_images,
+        "total_input_pairs": total_input_pairs,
         "successful_inferences": len(metrics), 
         "total_experiment_time_seconds": experiment_time,
 
@@ -469,7 +608,7 @@ if metrics:
 else:
 
     summary = {
-        "total_input_images": total_input_images,
+        "total_input_pairs": total_input_pairs,
         "successful_inferences": 0,
         "total_experiment_time_seconds": experiment_time
     }

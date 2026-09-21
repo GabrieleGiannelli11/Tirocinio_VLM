@@ -34,6 +34,12 @@ MODELS = [
 JUDGE_MODEL = "NOME_DEL_MODELLO"
 
 # ============================
+# Configurazione del batching
+# ============================
+
+BATCH_SIZE = 4
+
+# ============================
 # Parametri di generazione
 # ============================
 
@@ -62,3 +68,4 @@ DECODING_CONFIGS = {
 
 # Parametri del modello Judge
 JUDGE_TEMPERATURE = 0.0
+

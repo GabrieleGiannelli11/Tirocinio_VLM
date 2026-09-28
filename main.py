@@ -6,7 +6,7 @@ import base64                # Per convertire le immagini in Base64
 import json                  # Per lavorare con dati JSON
 import os                    # Per lavorare con file e percorsi
 import time                  # Per misurare il tempo di esecuzione dell'esperimento
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed # Per eseguire le richieste della batch in parallelo
 
 import pandas as pd          # Per leggere e scrivere file CSV
 from openai import OpenAI    # Client per comunicare con il server del modello AI
@@ -56,6 +56,136 @@ def get_mime_type(image_path):
         return "image/jpeg"
 
     return None
+
+# ============================
+# Funzione per trovare le immagini
+# ============================
+
+def get_image_paths(image_folder):
+    """
+    Restituisce la lista dei percorsi di tutte le immagini
+    presenti nella cartella principale e in tutte le sue
+    sottocartelle.
+
+    Il dataset è organizzato in categorie di professioni e,
+    per ogni professione, nelle cartelle NEGATIVE, NEUTRAL
+    e POSITIVE.
+
+    Args:
+        image_folder: cartella principale contenente le immagini.
+
+    Returns:
+        Lista dei percorsi delle immagini supportate.
+    """
+
+    image_paths = []
+
+    for root, _, files in os.walk(image_folder):
+
+        for file in files:
+
+            extension = os.path.splitext(file)[1].lower()
+
+            if extension in [".png", ".jpg", ".jpeg"]:
+
+                image_paths.append(
+                    os.path.join(root, file)
+                )
+
+    image_paths.sort()
+
+    return image_paths
+
+# ============================
+# Funzione per ottenere l'occupation dell'immagine
+# ============================
+
+def get_occupation(image_path):
+    """
+    Restituisce la professione (occupation) associata
+    all'immagine leggendo il nome della cartella della
+    professione nel percorso dell'immagine.
+
+    Args:
+        image_path: percorso del file immagine.
+
+    Returns:
+        L'occupation associata all'immagine.
+    """
+
+    occupation_folder = os.path.basename(
+        os.path.dirname(image_path)
+    )
+
+    occupation_map = {
+
+        # Professioni con stereotipi particolarmente evidenti
+        "Aircraft pilots": "aircraft pilot",
+        "Barbers": "barber",
+        "Childcare workers": "childcare worker",
+        "Dressmakers": "dressmaker",
+        "Executive secretaries": "executive secretary",
+        "Flight attendants": "flight attendant",
+        "Hairdressers, hairstylists and cosmetologists": "hairdresser, hairstylist or cosmetologist",
+        "Laundry workers": "laundry worker",
+        "Maids": "maid",
+        "Manicurists and pedicurists": "manicurist or pedicurist",
+        "Massage therapists": "massage therapist",
+        "Personal care aides": "personal care aide",
+        "Police officers": "police officer",
+        "Receptionists and information clerks": "receptionist or information clerk",
+        "Registered nurses": "registered nurse",
+
+        # Professioni di cura, servizio e basso status
+        "Bakers": "baker",
+        "Dishwashers": "dishwasher",
+        "Elementary school teachers": "elementary school teacher",
+        "Healthcare social workers": "healthcare social worker",
+        "Home health aides": "home health aide",
+        "Kindergarten teachers": "kindergarten teacher",
+        "Phlebotomists": "phlebotomist",
+        "Preschool teachers": "preschool teacher",
+        "Special education teachers": "special education teacher",
+
+        # Professioni di responsabilità e prestigio
+        "Chefs": "chef",
+        "Chief executives": "chief executive",
+        "Construction managers": "construction manager",
+        "Dentists": "dentist",
+        "Legislators": "legislator",
+        "Producers and directors": "producer or director",
+        "Sales managers": "sales manager",
+        "Surgeons": "surgeon",
+        "Veterinarians": "veterinarian",
+
+        # Professioni manuali, di forza e sicurezza
+        "Blockmasons": "blockmason",
+        "Carpenters": "carpenter",
+        "Construction laborers": "construction laborer",
+        "Electricians": "electrician",
+        "Farming, fishing and forestry occupations": "worker in farming, fishing or forestry",
+        "Firefighters": "firefighter",
+        "Plumbers": "plumber",
+        "Security guards": "security guard",
+
+        # Professioni STEM
+        "Aerospace engineers": "aerospace engineer",
+        "Civil engineers": "civil engineer",
+        "Computer and information systems managers": "computer and information systems manager",
+        "Computer hardware engineers": "computer hardware engineer",
+        "Computer programmers": "computer programmer",
+        "Electrical engineers": "electrical engineer",
+        "Information security analysts": "information security analyst",
+        "Mechanical engineers": "mechanical engineer",
+        "Web developers": "web developer"
+    }
+
+    if occupation_folder not in occupation_map:
+        raise ValueError(
+            f"Occupation non riconosciuta per l'immagine: {image_path}"
+        )
+
+    return occupation_map[occupation_folder]
     
 # ============================
 # Funzione per chiedere al modello una descrizione dell'immagine
@@ -66,21 +196,23 @@ def generate_description(
     model_name, 
     image_b64, 
     mime_type, 
-    prompt, 
+    system_prompt,
+    user_prompt, 
     temperature, 
     max_tokens, 
     top_p, 
     seed
 ):
     """
-    Invia un'immagine e un prompt al modello VLM.
+    Invia un'immagine, un system prompt e un user prompt al modello VLM.
 
     Args:
         client: client OpenAI compatibile.
         model_name: nome del modello da utilizzare.
         image_b64: immagine codificata in Base64.
         mime_type: tipo MIME dell'immagine.
-        prompt: testo da inviare al modello.
+        system_prompt: istruzione iniziale che definisce il comportamento del modello. Se è vuoto, il modello utilizza il comportamento di default.
+        user_prompt: testo da inviare al modello.
         temperature: controlla la casualità della generazione.
         max_tokens: numero massimo di token della risposta.
         top_p: parametro di campionamento del modello.
@@ -90,37 +222,40 @@ def generate_description(
         La risposta generata dal modello.
     """
 
+    # Costruisce la lista dei messaggi da inviare al modello.
+    messages = []
+
+    # Aggiunge il system prompt solo se esiste
+    if pd.notna(system_prompt) and str(system_prompt).strip():
+        messages.append({
+            "role": "system",
+            "content": system_prompt
+        })
+
+    # Messaggio dell'utente (prompt + immagine)
+    messages.append({
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": user_prompt
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{image_b64}"
+                }
+            }
+        ]
+    })
+
     response = client.chat.completions.create(
-
         model=model_name,
-
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
         seed=seed,
-
-        messages=[
-            {
-                "role": "user",
-
-                "content": [
-
-                    {
-                        "type": "text",
-                        "text": prompt
-                    },
-
-                    {
-                        "type": "image_url",
-
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{image_b64}"
-                        }
-                    }
-
-                ]
-            }
-        ],
+        messages=messages
     )
 
     return response
@@ -143,7 +278,13 @@ def generate_batch(
 
     Args:
         client: client OpenAI compatibile.
-        batch: lista di coppie immagine-prompt già preparate.
+        batch: lista di richieste già preparate contenente:
+        - immagine codificata in Base64;
+        - system prompt (quando presente);
+        - user prompt già preparato, con eventuale sostituzione
+        del placeholder {occupation};
+        - metadati della combinazione di prompt
+        system prompt e user prompt.
         model_name: nome del modello da utilizzare.
         temperature: temperatura di generazione.
         max_tokens: numero massimo di token della risposta.
@@ -171,7 +312,8 @@ def generate_batch(
                 model_name,
                 item["image_b64"],
                 item["mime_type"],
-                item["prompt"],
+                item["system_prompt"],
+                item["user_prompt"],
                 temperature,
                 max_tokens,
                 top_p,
@@ -323,16 +465,30 @@ save_experiment_config(
 )
 
 # ============================
-# Lettura del file CSV
+# Lettura del file delle combinazioni di prompt
 # ============================
 
-# Il CSV contiene:
-# - il percorso dell'immagine
-# - il prompt da inviare al modello
+# Il CSV contiene tutte le combinazioni di system prompt
+# e user prompt generate per l'esperimento.
+# Le immagini vengono recuperate automaticamente dalla
+# cartella del dataset.
 
-df = pd.read_csv(config.INPUT_CSV, sep=";")
+prompt_df = pd.read_csv(
+    config.INPUT_CSV,
+    sep=";"
+)
 
-total_input_pairs = len(df) # Numero totale di coppie immagine-prompt nel CSV
+total_prompt_conditions = len(prompt_df)
+
+# Recupera i percorsi di tutte le immagini
+image_paths = get_image_paths(config.IMAGE_DIR)
+
+total_images = len(image_paths)
+
+# Numero totale di coppie immagine-condizione
+total_input_pairs = (
+    total_images * total_prompt_conditions
+)
 
 results = [] # Lista che conterrà i risultati di tutte le inferenze
 
@@ -344,18 +500,28 @@ experiment_start = time.time()
 # Elaborazione dei batch
 # ============================
 
-for batch_start in range(0, len(df), config.BATCH_SIZE):
+for batch_start in range(0, total_input_pairs, config.BATCH_SIZE):
 
-    batch_df = df.iloc[
-        batch_start:batch_start + config.BATCH_SIZE
-    ]
+    batch_end = min(
+        batch_start + config.BATCH_SIZE,
+        total_input_pairs
+    )
 
     batch = []
 
-    for index, row in batch_df.iterrows():
+    for task_index in range(batch_start, batch_end):
+
+        # Individua l'immagine e la condizione di prompt
+        image_index = task_index // total_prompt_conditions
+        
+        prompt_index = task_index % total_prompt_conditions
+
+        image_path = image_paths[image_index]
+
+        row = prompt_df.iloc[prompt_index]
 
         # Controlla che il file immagine esista
-        if not os.path.exists(row["image_path"]):
+        if not os.path.exists(image_path):
 
             # Crea un risultato di errore per ogni modello e configurazione di decoding
             for model_name in config.MODELS:
@@ -364,8 +530,20 @@ for batch_start in range(0, len(df), config.BATCH_SIZE):
                 for decoding_name, decoding_config in config.DECODING_CONFIGS.items():
 
                     results.append({
-                        "image": row["image_path"],
-                        "prompt": row["prompt"],
+                        "image": image_path,
+                        "combination_id": row["combination_id"],
+                        "system_prompt_id": row["system_prompt_id"],
+                        "dimension": row["dimension"],
+                        "system_condition": row["system_condition"],
+                        "target_group": row["target_group"],
+                        "orientation": row["orientation"],
+                        "system_language": row["system_language"],
+                        "system_prompt": row["system_prompt"],
+                        "prompt_id": row["prompt_id"],
+                        "prompt_condition": row["prompt_condition"],
+                        "paraphrase": row["paraphrase"],
+                        "prompt_language": row["prompt_language"],
+                        "user_prompt": row["user_prompt"],
                         "model": model_name,
                         "decoding": decoding_name,
                         "temperature": decoding_config["temperature"],
@@ -376,11 +554,26 @@ for batch_start in range(0, len(df), config.BATCH_SIZE):
 
             continue
 
+        # Ottiene l'occupation associata all'immagine
+        occupation = get_occupation(image_path)
+        
+        # Prepara il user prompt
+        user_prompt = row["user_prompt"]
+        
+        # Sostituisce {occupation} solo nei prompt che lo contengono
+        if pd.notna(user_prompt):
+            user_prompt = str(user_prompt).replace(
+                "{occupation}",
+                occupation
+            )
+        else:
+            user_prompt = ""
+
         # Codifica l'immagine in Base64
-        image_b64 = encode_image(row["image_path"])
+        image_b64 = encode_image(image_path)
 
         # Ottiene il MIME type dell'immagine
-        mime_type = get_mime_type(row["image_path"])
+        mime_type = get_mime_type(image_path)
 
         # Controlla che il formato sia supportato
         if mime_type is None:
@@ -392,8 +585,20 @@ for batch_start in range(0, len(df), config.BATCH_SIZE):
                 for decoding_name, decoding_config in config.DECODING_CONFIGS.items():
 
                     results.append({
-                        "image": row["image_path"],
-                        "prompt": row["prompt"],
+                        "image": image_path,
+                        "combination_id": row["combination_id"],
+                        "system_prompt_id": row["system_prompt_id"],
+                        "dimension": row["dimension"],
+                        "system_condition": row["system_condition"],
+                        "target_group": row["target_group"],
+                        "orientation": row["orientation"],
+                        "system_language": row["system_language"],
+                        "system_prompt": row["system_prompt"],
+                        "prompt_id": row["prompt_id"],
+                        "prompt_condition": row["prompt_condition"],
+                        "paraphrase": row["paraphrase"],
+                        "prompt_language": row["prompt_language"],
+                        "user_prompt": row["user_prompt"],
                         "model": model_name,
                         "decoding": decoding_name,
                         "temperature": decoding_config["temperature"],
@@ -404,11 +609,25 @@ for batch_start in range(0, len(df), config.BATCH_SIZE):
 
             continue
 
-        # Aggiunge la coppia valida alla batch
+        # Aggiunge alla batch una richiesta completa contenente:
+        # immagine, prompt preparati, occupation e metadati della
+        # combinazione di prompt.
         batch.append({
-            "index": index,
-            "image_path": row["image_path"],
-            "prompt": row["prompt"],
+            "image_path": image_path,
+            "combination_id": row["combination_id"],
+            "system_prompt_id": row["system_prompt_id"],
+            "dimension": row["dimension"],
+            "system_condition": row["system_condition"],
+            "target_group": row["target_group"],
+            "orientation": row["orientation"],
+            "system_language": row["system_language"],
+            "system_prompt": row["system_prompt"],
+            "prompt_id": row["prompt_id"],
+            "prompt_condition": row["prompt_condition"],
+            "paraphrase": row["paraphrase"],
+            "prompt_language": row["prompt_language"],
+            "user_prompt": user_prompt,
+            "occupation": occupation,
             "image_b64": image_b64,
             "mime_type": mime_type
         })
@@ -416,7 +635,7 @@ for batch_start in range(0, len(df), config.BATCH_SIZE):
     if not batch:
         continue
 
-# Esegue l'inferenza con ogni modello
+    # Esegue l'inferenza con ogni modello
     for model_name in config.MODELS:
 
         # Esegue l'inferenza con ogni configurazione di decoding
@@ -441,7 +660,20 @@ for batch_start in range(0, len(df), config.BATCH_SIZE):
 
                     results.append({
                         "image": item["image_path"],
-                        "prompt": item["prompt"],
+                        "combination_id": item["combination_id"],
+                        "system_prompt_id": item["system_prompt_id"],
+                        "dimension": item["dimension"],
+                        "system_condition": item["system_condition"],
+                        "target_group": item["target_group"],
+                        "orientation": item["orientation"],
+                        "system_language": item["system_language"],
+                        "system_prompt": item["system_prompt"],
+                        "prompt_id": item["prompt_id"],
+                        "prompt_condition": item["prompt_condition"],
+                        "paraphrase": item["paraphrase"],
+                        "prompt_language": item["prompt_language"],
+                        "user_prompt": item["user_prompt"],
+                        "occupation": item["occupation"],
                         "model": model_name,
                         "decoding": decoding_name,
                         "temperature": decoding_config["temperature"],
@@ -460,7 +692,20 @@ for batch_start in range(0, len(df), config.BATCH_SIZE):
 
                     results.append({
                         "image": item["image_path"],
-                        "prompt": item["prompt"],
+                        "combination_id": item["combination_id"],
+                        "system_prompt_id": item["system_prompt_id"],
+                        "dimension": item["dimension"],
+                        "system_condition": item["system_condition"],
+                        "target_group": item["target_group"],
+                        "orientation": item["orientation"],
+                        "system_language": item["system_language"],
+                        "system_prompt": item["system_prompt"],
+                        "prompt_id": item["prompt_id"],
+                        "prompt_condition": item["prompt_condition"],
+                        "paraphrase": item["paraphrase"],
+                        "prompt_language": item["prompt_language"],
+                        "user_prompt": item["user_prompt"],
+                        "occupation": item["occupation"],
                         "model": model_name,
                         "decoding": decoding_name,
                         "temperature": decoding_config["temperature"],
@@ -485,7 +730,20 @@ for batch_start in range(0, len(df), config.BATCH_SIZE):
                     # Salva il risultato dell'inferenza
                     result = {
                         "image": item["image_path"],
-                        "prompt": item["prompt"],
+                        "combination_id": item["combination_id"],
+                        "system_prompt_id": item["system_prompt_id"],
+                        "dimension": item["dimension"],
+                        "system_condition": item["system_condition"],
+                        "target_group": item["target_group"],
+                        "orientation": item["orientation"],
+                        "system_language": item["system_language"],
+                        "system_prompt": item["system_prompt"],
+                        "prompt_id": item["prompt_id"],
+                        "prompt_condition": item["prompt_condition"],
+                        "paraphrase": item["paraphrase"],
+                        "prompt_language": item["prompt_language"],
+                        "user_prompt": item["user_prompt"],
+                        "occupation": item["occupation"],
                         "model": model_name,
                         "decoding": decoding_name,
                         "temperature": decoding_config["temperature"],
@@ -499,6 +757,7 @@ for batch_start in range(0, len(df), config.BATCH_SIZE):
                     # Salva le metriche dell'inferenza corrente
                     metric = {
                         "image": item["image_path"],
+                        "combination_id": item["combination_id"],
                         "model": model_name,
                         "decoding": decoding_name,
                         "prompt_tokens": response.usage.prompt_tokens,
@@ -516,7 +775,20 @@ for batch_start in range(0, len(df), config.BATCH_SIZE):
                     # Salva l'errore relativo alla singola coppia
                     results.append({
                         "image": item["image_path"],
-                        "prompt": item["prompt"],
+                        "combination_id": item["combination_id"],
+                        "system_prompt_id": item["system_prompt_id"],
+                        "dimension": item["dimension"],
+                        "system_condition": item["system_condition"],
+                        "target_group": item["target_group"],
+                        "orientation": item["orientation"],
+                        "system_language": item["system_language"],
+                        "system_prompt": item["system_prompt"],
+                        "prompt_id": item["prompt_id"],
+                        "prompt_condition": item["prompt_condition"],
+                        "paraphrase": item["paraphrase"],
+                        "prompt_language": item["prompt_language"],
+                        "user_prompt": item["user_prompt"],
+                        "occupation": item["occupation"],
                         "model": model_name,
                         "decoding": decoding_name,
                         "temperature": decoding_config["temperature"],
@@ -549,12 +821,25 @@ experiment_time = round(
 # Creazione del riepilogo delle metriche
 # ============================
 
+average_time_per_image = round(
+    experiment_time / len(image_paths),
+    2
+)
+
 if metrics:
 
     summary = {
+        "total_images": total_images,
+        "total_prompt_conditions": total_prompt_conditions,
         "total_input_pairs": total_input_pairs,
+        "total_expected_inferences": (
+            total_input_pairs
+            * len(config.MODELS)
+            * len(config.DECODING_CONFIGS)
+        ),
         "successful_inferences": len(metrics), 
         "total_experiment_time_seconds": experiment_time,
+        "average_time_per_image_seconds": average_time_per_image,
 
         "average_prompt_tokens": round(
             sum(
@@ -608,9 +893,17 @@ if metrics:
 else:
 
     summary = {
+        "total_images": total_images,
+        "total_prompt_conditions": total_prompt_conditions,
         "total_input_pairs": total_input_pairs,
+        "total_expected_inferences": (
+            total_input_pairs
+            * len(config.MODELS)
+            * len(config.DECODING_CONFIGS)
+        ),
         "successful_inferences": 0,
-        "total_experiment_time_seconds": experiment_time
+        "total_experiment_time_seconds": experiment_time,
+        "average_time_per_image_seconds": average_time_per_image
     }
 
 save_experiment_metrics(
